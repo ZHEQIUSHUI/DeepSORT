@@ -1,0 +1,6 @@
+[submodule "third_party/SimpleCV"]
+	path = third_party/SimpleCV
+	url = git@github.com:ZHEQIUSHUI/SimpleCV.git
+[submodule "third_party/ax-video-sdk"]
+	path = third_party/ax-video-sdk
+	url = git@github.com:AXERA-TECH/ax-video-sdk.git

@@ -4,186 +4,142 @@
     @Date        : 2022-09-21 04:32:26
 */
 
-//#include "globalconfig.h"
 #include "FeatureTensor.h"
-#include <iostream>
 
-FeatureTensor *FeatureTensor::instance = NULL;
+#include <algorithm>
+#include <cstddef>
+#include <cstdlib>
+#include <string>
+#include <utility>
+#include <vector>
 
-FeatureTensor *FeatureTensor::getInstance()
-{
-    if (instance == NULL)
-    {
+FeatureTensor* FeatureTensor::instance = nullptr;
+
+FeatureTensor* FeatureTensor::getInstance() {
+    if (instance == nullptr) {
         instance = new FeatureTensor();
     }
     return instance;
 }
 
-FeatureTensor::FeatureTensor()
-{
-    // prepare model:
-    bool status = init();
-    if (status == false)
-    {
-        std::cout << "init failed" << std::endl;
-        exit(1);
-    }
-    else
-    {
-        std::cout << "init succeed" << std::endl;
-    }
+namespace {
+
+int ClampInt(int v, int lo, int hi) {
+    return std::max(lo, std::min(v, hi));
 }
 
-FeatureTensor::~FeatureTensor()
-{
+}  // namespace
+
+void FeatureTensor::deinit() {
+    extractor_.Deinit();
+    inited_ = false;
+    input_w_ = 0;
+    input_h_ = 0;
 }
 
-bool FeatureTensor::init()
-{
+bool FeatureTensor::init(const std::string& model_path,
+                         const std::string& color_order,
+                         int device_id,
+                         std::string* error) {
+    deepsort::npu::ReidFeatureExtractorOptions opt{};
+    opt.model_path = model_path;
+    opt.device_id = device_id;
+    opt.color_order = (color_order == "bgr") ? deepsort::npu::ColorOrder::kBgr : deepsort::npu::ColorOrder::kRgb;
 
-    Ort::TypeInfo inputTypeInfo = session_.GetInputTypeInfo(0);
-    auto inputTensorInfo = inputTypeInfo.GetTensorTypeAndShapeInfo();
+    std::string err;
+    if (!extractor_.Init(opt, &err)) {
+        inited_ = false;
+        if (error) *error = err;
+        return false;
+    }
 
-    ONNXTensorElementDataType inputType = inputTensorInfo.GetElementType();
-    std::cout << "Input Type: " << inputType << std::endl;
+    if (extractor_.feature_dim() != k_feature_dim) {
+        extractor_.Deinit();
+        inited_ = false;
+        if (error) {
+            *error = "unexpected feature dim: " + std::to_string(extractor_.feature_dim()) +
+                     " (expected " + std::to_string(k_feature_dim) + ")";
+        }
+        return false;
+    }
 
-    inputDims_ = inputTensorInfo.GetShape();
-    std::cout << "Input Dimensions: " << inputDims_ << std::endl; // [-1, 3, 128, 64]
-    inputDims_[0] = 1;
-    std::cout << "FeatureTensor::init() " << std::endl;
+    input_w_ = extractor_.input_width();
+    input_h_ = extractor_.input_height();
+    inited_ = true;
 
-
+    // AXCL runtime registers its own exit handler; ensure we deinit before that.
+    static bool atexit_hooked = false;
+    if (!atexit_hooked) {
+        atexit_hooked = true;
+        std::atexit([]() { FeatureTensor::getInstance()->deinit(); });
+    }
     return true;
 }
 
-void FeatureTensor::preprocess(cv::Mat &imageBGR, std::vector<float> &inputTensorValues, size_t &inputTensorSize)
-{
+bool FeatureTensor::getRectsFeature(const SimpleCV::Mat& img, DETECTIONS& d, std::string* error) {
+    if (!inited_) {
+        if (error) *error = "FeatureTensor not initialized (call init first)";
+        return false;
+    }
+    if (img.empty() || img.data == nullptr || img.width <= 0 || img.height <= 0) {
+        if (error) *error = "invalid input image";
+        return false;
+    }
+    if (img.channels != 3) {
+        if (error) *error = "expected 3-channel BGR image";
+        return false;
+    }
+    if (d.empty()) return true;
 
-    // pre-processing the Image
-    //  step 1: Read an image in HWC BGR UINT8 format.
-    //  cv::Mat imageBGR = cv::imread(imageFilepath, cv::ImreadModes::IMREAD_COLOR);
+    DETECTIONS out;
+    out.reserve(d.size());
 
-    // step 2: Resize the image.
-    cv::Mat resizedImageBGR, resizedImageRGB, resizedImage, preprocessedImage;
-       cv::resize(imageBGR, resizedImageBGR,
-                  cv::Size(inputDims_.at(3), inputDims_.at(2)),
-                  cv::InterpolationFlags::INTER_CUBIC);
+    std::string first_err;
+    for (const DETECTION_ROW& det : d) {
+        const float x0 = det.tlwh(0);
+        const float y0 = det.tlwh(1);
+        const float w0 = det.tlwh(2);
+        const float h0 = det.tlwh(3);
+        if (w0 <= 1.0F || h0 <= 1.0F) continue;
 
-    // cv::resize(imageBGR, resizedImageBGR,
-    //            cv::Size(64, 128));
+        // Match legacy DeepSORT implementation:
+        //   rc.x -= (rc.height * 0.5 - rc.width) * 0.5;
+        //   rc.width = rc.height * 0.5;
+        const float new_w = h0 * 0.5F;
+        const float new_x = x0 + (w0 - new_w) * 0.5F;
+        const float new_y = y0;
 
-    // step 3: Convert the image to HWC RGB UINT8 format.
-    cv::cvtColor(resizedImageBGR, resizedImageRGB,
-                 cv::ColorConversionCodes::COLOR_BGR2RGB);
-    // step 4: Convert the image to HWC RGB float format by dividing each pixel by 255.
-    resizedImageRGB.convertTo(resizedImage, CV_32F, 1.0 / 255);
+        int rx = static_cast<int>(new_x);
+        int ry = static_cast<int>(new_y);
+        int rw = static_cast<int>(new_w);
+        int rh = static_cast<int>(h0);
 
-    // step 5: Split the RGB channels from the image.
-    cv::Mat channels[3];
-    cv::split(resizedImage, channels);
+        rx = ClampInt(rx, 0, img.width - 1);
+        ry = ClampInt(ry, 0, img.height - 1);
+        rw = std::max(1, std::min(rw, img.width - rx));
+        rh = std::max(1, std::min(rh, img.height - ry));
 
-    // step 6: Normalize each channel.
-    //  Normalization per channel
-    //  Normalization parameters obtained from your custom model
+        unsigned char* p = img.data + static_cast<std::size_t>(ry) * static_cast<std::size_t>(img.step) +
+                           static_cast<std::size_t>(rx) * 3U;
+        SimpleCV::Mat patch(rh, rw, 3, p, img.step, false);
 
-    channels[0] = (channels[0] - 0.485) / 0.229;
-    channels[1] = (channels[1] - 0.456) / 0.224;
-    channels[2] = (channels[2] - 0.406) / 0.225;
-
-    // step 7: Merge the RGB channels back to the image.
-    cv::merge(channels, 3, resizedImage);
-
-    // step 8: Convert the image to CHW RGB float format.
-    // HWC to CHW
-    cv::dnn::blobFromImage(resizedImage, preprocessedImage);
-    inputTensorSize = vectorProduct(inputDims_);
-    inputTensorValues.assign(preprocessedImage.begin<float>(),
-                             preprocessedImage.end<float>());
-
-    std::cout << "inputTensorSize:" << inputTensorValues.size() << std::endl;
-}
-
-bool FeatureTensor::getRectsFeature(const cv::Mat &img, DETECTIONS &d)
-{
-
-    for (DETECTION_ROW &dbox : d)
-    {
-        cv::Rect rc = cv::Rect(int(dbox.tlwh(0)), int(dbox.tlwh(1)),
-                               int(dbox.tlwh(2)), int(dbox.tlwh(3)));
-        rc.x -= (rc.height * 0.5 - rc.width) * 0.5;
-        rc.width = rc.height * 0.5;
-        rc.x = (rc.x >= 0 ? rc.x : 0);
-        rc.y = (rc.y >= 0 ? rc.y : 0);
-        rc.width = (rc.x + rc.width <= img.cols ? rc.width : (img.cols - rc.x));
-        rc.height = (rc.y + rc.height <= img.rows ? rc.height : (img.rows - rc.y));
-
-        cv::Mat mattmp = img(rc).clone();
-
-        std::vector<float> inputTensorValues;
-        size_t inputTensorSize;
-        preprocess(mattmp, inputTensorValues, inputTensorSize);
-
-        const char *input_names[] = {"input"};   //输入节点名
-        const char *output_names[] = {"output"}; //输出节点名
-
-        auto memory_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
-        output_tensor_ = Ort::Value::CreateTensor<float>(memory_info, results_.data(), results_.size(), output_shape_.data(), output_shape_.size());
-
-        std::vector<Ort::Value> inputTensors;
-        inputTensors.push_back(Ort::Value::CreateTensor<float>(
-            memory_info, inputTensorValues.data(), inputTensorSize, inputDims_.data(),
-            inputDims_.size()));
-
-
-        session_.Run(Ort::RunOptions{nullptr}, input_names, inputTensors.data(), 1, output_names, &output_tensor_, 1);
-     
-        Ort::TensorTypeAndShapeInfo shape_info = output_tensor_.GetTensorTypeAndShapeInfo();
-
-
-        size_t dim_count = shape_info.GetDimensionsCount();
-        std::cout << "dim_count:" << dim_count << std::endl;
-
-  
-        int64_t dims[2];
-        shape_info.GetDimensions(dims, sizeof(dims) / sizeof(dims[0]));
-        std::cout << "output shape:" << dims[0] << "," << dims[1] << std::endl;
-
-
-        float *f = output_tensor_.GetTensorMutableData<float>();
-        for (int i = 0; i < dims[1]; i++) //sisyphus
-        {
-            dbox.feature[i] = f[i];
+        std::vector<float> feat;
+        std::string ext_err;
+        if (!extractor_.Extract(patch, &feat, &ext_err) || feat.size() != static_cast<std::size_t>(k_feature_dim)) {
+            if (first_err.empty()) first_err = ext_err.empty() ? "feature extract failed" : std::move(ext_err);
+            continue;
         }
+
+        DETECTION_ROW row = det;
+        for (int i = 0; i < k_feature_dim; ++i) {
+            row.feature[i] = feat[static_cast<std::size_t>(i)];
+        }
+        out.push_back(std::move(row));
     }
 
+    d.swap(out);
+    if (error && !first_err.empty()) {
+        *error = first_err;
+    }
     return true;
-}
-
-void FeatureTensor::tobuffer(const std::vector<cv::Mat> &imgs, uint8 *buf)
-{
-    int pos = 0;
-    for (const cv::Mat &img : imgs)
-    {
-        int Lenth = img.rows * img.cols * 3;
-        int nr = img.rows;
-        int nc = img.cols;
-        if (img.isContinuous())
-        {
-            nr = 1;
-            nc = Lenth;
-        }
-        for (int i = 0; i < nr; i++)
-        {
-            const uchar *inData = img.ptr<uchar>(i);
-            for (int j = 0; j < nc; j++)
-            {
-                buf[pos] = *inData++;
-                pos++;
-            }
-        } // end for
-    }     // end imgs;
-}
-void FeatureTensor::test()
-{
-    return;
 }

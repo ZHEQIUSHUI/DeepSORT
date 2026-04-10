@@ -1,0 +1,113 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - chip: ax650
+            script: ./build_ax650.sh
+            msp_zip: msp_50_3.10.2.zip
+            msp_url: https://github.com/ZHEQIUSHUI/assets/releases/download/ax_3.6.2/msp_50_3.10.2.zip
+            apt_pkgs: libeigen3-dev unzip xz-utils
+            toolchain_url: https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
+            toolchain_archive: gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
+            toolchain_root: gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu
+          - chip: axcl-x86_64
+            script: ./build_axcl_x86.sh
+            msp_zip: axcl_linux_3.10.2.zip
+            msp_url: https://github.com/ZHEQIUSHUI/assets/releases/download/ax_3.6.2/axcl_linux_3.10.2.zip
+            apt_pkgs: libeigen3-dev unzip
+            toolchain_url: ""
+            toolchain_archive: ""
+            toolchain_root: ""
+          - chip: axcl-aarch64
+            script: ./build_axcl_aarch64.sh
+            msp_zip: axcl_linux_3.10.2.zip
+            msp_url: https://github.com/ZHEQIUSHUI/assets/releases/download/ax_3.6.2/axcl_linux_3.10.2.zip
+            apt_pkgs: libeigen3-dev unzip xz-utils
+            toolchain_url: https://developer.arm.com/-/media/Files/downloads/gnu-a/9.2-2019.12/binrel/gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
+            toolchain_archive: gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu.tar.xz
+            toolchain_root: gcc-arm-9.2-2019.12-x86_64-aarch64-none-linux-gnu
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Cache CI Assets
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ci/downloads
+            .ci/toolchains
+            .ci/msp
+            .ci/axcl
+          key: ${{ runner.os }}-${{ matrix.chip }}-${{ hashFiles('.github/workflows/build.yml', 'scripts/build_common.sh', 'toolchains/*.cmake', 'CMakeLists.txt') }}
+
+      - name: Install Dependencies
+        if: matrix.apt_pkgs != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.apt_pkgs }}
+
+      - name: Download MSP / AXCL
+        env:
+          MSP_URL: ${{ matrix.msp_url }}
+          MSP_ZIP: ${{ matrix.msp_zip }}
+        run: |
+          mkdir -p "${{ github.workspace }}/.ci/downloads"
+          if [ ! -f "${{ github.workspace }}/.ci/downloads/$MSP_ZIP" ]; then
+            curl -L "$MSP_URL" -o "${{ github.workspace }}/.ci/downloads/$MSP_ZIP"
+          fi
+
+      - name: Download Toolchain
+        if: matrix.toolchain_url != ''
+        env:
+          TOOLCHAIN_URL: ${{ matrix.toolchain_url }}
+          TOOLCHAIN_ARCHIVE: ${{ matrix.toolchain_archive }}
+          TOOLCHAIN_ROOT: ${{ matrix.toolchain_root }}
+        run: |
+          TOOLCHAIN_BASE="${{ github.workspace }}/.ci/toolchains"
+          TOOLCHAIN_BIN_DIR="$TOOLCHAIN_BASE/$TOOLCHAIN_ROOT/bin"
+          mkdir -p "$TOOLCHAIN_BASE"
+          if [ ! -f "$TOOLCHAIN_BASE/$TOOLCHAIN_ARCHIVE" ]; then
+            curl -L "$TOOLCHAIN_URL" -o "$TOOLCHAIN_BASE/$TOOLCHAIN_ARCHIVE"
+          fi
+          if [ ! -d "$TOOLCHAIN_BIN_DIR" ]; then
+            case "$TOOLCHAIN_ARCHIVE" in
+              *.tar.xz|*.tgz|*.tar.gz)
+                tar -xf "$TOOLCHAIN_BASE/$TOOLCHAIN_ARCHIVE" -C "$TOOLCHAIN_BASE"
+                ;;
+              *)
+                echo "unsupported toolchain archive: $TOOLCHAIN_ARCHIVE" >&2
+                exit 1
+                ;;
+            esac
+          fi
+          test -d "$TOOLCHAIN_BIN_DIR"
+
+      - name: Build
+        env:
+          DEEPSORT_MSP_ZIP_PATH: ${{ github.workspace }}/.ci/downloads/${{ matrix.msp_zip }}
+          DEEPSORT_TOOLCHAIN_BIN: ${{ github.workspace }}/.ci/toolchains/${{ matrix.toolchain_root }}/bin
+        run: |
+          chmod +x ./build_ax650.sh ./build_axcl_x86.sh ./build_axcl_aarch64.sh ./scripts/build_common.sh
+          ${{ matrix.script }}
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepsort_${{ matrix.chip }}
+          path: artifacts/${{ matrix.chip }}/deepsort_${{ matrix.chip }}.tar.gz
+

@@ -1,0 +1,4 @@
+build*/
+.ci/
+artifacts/
+.vscode/

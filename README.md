@@ -1,160 +1,83 @@
-# DeepSORT
+# DeepSORT (AXCL / NPU)
 
-# MOT(Multi-object tracking) using yolov5 with C++ support deepsort and bytetrack
+这是一个面向 AXERA NPU（AXCL）使用场景的 **DeepSORT 跟踪分支**：
 
+- **Detector**：YOLOv5 / YOLOv8（`.axmodel`），AXCL 推理 + CPU 后处理
+- **ReID**：DeepSORT 特征提取（`.axmodel`），AXCL 推理（输出 512 维特征）
+- **Video Demo**：集成 `ax-video-sdk`，完成 **解码 → IVPS 预处理/抠图 → 检测+ReID+DeepSORT → OSD → 编码** 的端到端示例
+- **不依赖 OpenCV / onnxruntime**：图片读写与基础绘制使用 `SimpleCV` 子模块
 
-flyfish
+## 模型下载（从 Release 获取）
 
-## 前言
-代码采用C++实现，目标检测支持YOLOv5 6.2,跟踪支持deepsort and bytetrack。
-检测模型可以直接从YOLOv5官网，导出onnx使用
-特征提取可以自己训练，导出onnx使用，onnxruntime cpu 推理，方便使用.
-特征支持自定义维度例如 128,256,512等
+模型不随仓库提交。请从本仓库的 **GitHub Releases** 下载并自行放置到本地路径，然后通过命令行传入：
 
-本文源码地址
+- YOLO：`yolov5s.axmodel`（或你自己的 yolov8 `.axmodel`）
+- ReID：`ckpt_bs1.axmodel`
+  - 输入：`1 x 128 x 64 x 3`，`uint8`（HWC）
+  - 输出：`1 x 512`，`float32`
 
-```c
-https://github.com/shaoshengsong/DeepSORT
+## 编译
+
+依赖：
+
+- CMake >= 3.16，C++17
+- `Eigen3`
+- AXCL SDK（默认按 `/usr/include/axcl` + `/usr/lib/axcl` 查找）
+- 子模块：`SimpleCV`、`ax-video-sdk`
+  - 仓库内提供 `build_axcl_x86.sh / build_axcl_aarch64.sh / build_ax650.sh`（参考 `ax-video-sdk`）用于 CI/本地一键编译与打包
+
+拉取子模块并编译：
+
+```bash
+git submodule update --init --recursive
+mkdir -p build && cd build
+cmake ..
+make -j
 ```
 
-## deepsort v1.12
-新增bytetrack跟踪
+> 说明：默认 `DEEPSORT_AXCL_INIT_IN_RUNNER=OFF`，AXCL 运行时/Context/Engine 初始化在应用侧（示例见 `test_detector.cpp`/`test_reid.cpp`/`demo_axvsdk_deepsort.cpp`）。
+> 若你希望 Runner 内部自初始化（不依赖外部初始化流程），可配置 `-DDEEPSORT_AXCL_INIT_IN_RUNNER=ON`。
 
-bytetrack论文
-```c
-http://arxiv.org/abs/2110.06864
+## 运行
+
+### 1) 视频跟踪 demo（推荐）
+
+```bash
+./demo_axvsdk_deepsort \
+  --input  /path/to/input.mp4 \
+  --output /path/to/output.mp4 \
+  --yolo   /path/to/yolo.axmodel \
+  --reid   /path/to/ckpt_bs1.axmodel \
+  --yolo_type yolov5 \
+  --reid_color rgb \
+  --device_id 0
 ```
 
-bytetrack代码
-```c
-https://github.com/ifzhang/ByteTrack
+参数说明（节选）：
+
+- `--yolo_type`：`yolov5|yolov8`
+- `--reid_color`：`rgb|bgr`
+- `--max_frames`：限制处理帧数（`0` 表示全量）
+
+### 2) 单张图检测
+
+```bash
+./test_detector --model /path/to/yolo.axmodel --image /path/to/image.jpg --type yolov5 --device_id 0
 ```
 
-## deepsort v1.1
-deepsort原论文地址 
+### 3) 单张图 ReID 特征提取
 
-```c
-https://arxiv.org/pdf/1703.07402.pdf
+```bash
+./test_reid --model /path/to/ckpt_bs1.axmodel --image /path/to/image.jpg --color rgb --device_id 0
 ```
 
+### 4) 图片序列跟踪（离线）
 
-```c
-MOT using deepsort yolo5 with C++
+```bash
+./run_deepsort 'frames_in/*.jpg' frames_out /path/to/yolo.axmodel /path/to/ckpt_bs1.axmodel yolov5 rgb 300
 ```
 
-操作系统：Ubuntu 18.04
-### 版本更新说明
+## 备注
 
-去除了TensorFlow依赖
-为了不依赖硬件GPU，无需cuda，cudnn，更容易编译，使用PC版本。
-为了更方便编译，采用CMakeList.txt。
-
-
-### 依赖的库
-opencv，可以下载opencv-4.6编译安装
-Eigen3安装
-
-```c
-sudo apt-get install libeigen3-dev
-```
-
-onnxruntime，可以直接解压使用，无需编译
-目标检测模型下载地址
-
-```c
-https://github.com/ultralytics/yolov5
-```
-
-网盘中有已经导出完成的模型
-
-### 文件下载
-百度网盘 
-链接：`https://pan.baidu.com/s/1igjNK2ty-H5AU_Ut08pkoA` 
-提取码：0000
-内容包括
-
-```c
-cmake-3.21.4-linux-x86_64.tar.gz  
-onnxruntime-linux-x64-1.12.1.tgz
-coco_80_labels_list.txt           
-opencv-4.6.0.zip
-DeepSORT                          
-yolov5s.onnx
-feature.onnx                      
-yolov5x.onnx
-```
-
-
-### 使用方法
-#### 1 onnxruntime
-设置自己的onnxruntime的解压目录
-
-```
-set(ONNXRUNTIME_DIR "/home/a/lib/onnxruntime-linux-x64-1.12.1")
-```
-
-
-#### 2 模型配置
-以下三项根据自己的需要更改
-文件`tracker/deepsort/include/dataType.h`
-```c
-const int k_feature_dim=512;//feature dim
-const std::string  k_feature_model_path ="./feature.onnx";
-const std::string  k_detect_model_path ="./yolov5s.onnx";
-```
-
-#### 3 主函数
-选择打开视频文件或者视频流等
-
-```c
-cv::VideoCapture capture("./1.mp4");
-```
-
-### 扩展方式
-1 整体分为两部分，新增检测模块放置detector文件夹，新增跟踪模块放置tracker文件夹
-
-## deepsort v1.0
-### MOT using deepsort yolo3 with C++
-操作系统：Ubuntu 18.04
-编译环境：Qt 5.12.2
-深度学习的模型分两块，一个是目标检测，另一个是目标跟踪
-#### 目标检测的模型
-地址：`https://pjreddie.com/darknet/yolo/`
-
-
-#### 目标跟踪模型
-mars-small128 
-OpenCV DNN加载YOLO模型，不依赖Darknet库，cuda，cudnn
-依赖Tensorflow，目标跟踪的特征部分使用TensorFlow C++的api。
-
-OpenCV的安装可以参考
-
-
-地址:  `https://blog.csdn.net/flyfish1986/article/details/89157368`
-
-
-Tensorflow的安装可以参考
-
-地址：`https://blog.csdn.net/flyfish1986/article/details/89406211`
-
-
-
-
-[多目标跟踪论文 Deep SORT 解读](https://flyfish.blog.csdn.net/article/details/89852370)  
-[多目标跟踪论文 Deep SORT 实现](https://flyfish.blog.csdn.net/article/details/90034289)  
-[多目标跟踪论文 Deep SORT 数据集说明](https://flyfish.blog.csdn.net/article/details/90070639) 
-[多目标跟踪论文 Deep SORT 特征提取CNN Architecture](https://flyfish.blog.csdn.net/article/details/90642532)  
-[多目标跟踪论文 Deep SORT 特征训练PyTorch实现](https://flyfish.blog.csdn.net/article/details/90702620)              
-[多目标跟踪论文 Deep SORT 特征训练TensorFlow实现](https://flyfish.blog.csdn.net/article/details/90379444)  
-[多目标跟踪论文 Deep SORT 评测指标](https://flyfish.blog.csdn.net/article/details/90200171)  
-[匈牙利算法](https://flyfish.blog.csdn.net/article/details/104298521)  
-[卡尔曼滤波 - 方程组转换为矩阵形式](https://flyfish.blog.csdn.net/article/details/118635703)  
-[卡尔曼滤波 - 一个方程背后的样子](https://flyfish.blog.csdn.net/article/details/118636055)  
-[卡尔曼滤波 - 匀变速直线运动](https://flyfish.blog.csdn.net/article/details/118613382)  
-[卡尔曼滤波 - 冥冥之中自有定数的正态分布](https://flyfish.blog.csdn.net/article/details/116067569)  
-[卡尔曼滤波 - 数据融合 data fusion](https://flyfish.blog.csdn.net/article/details/118613307)  
-[卡尔曼滤波 - 当前均值与上一次均值的关系](https://flyfish.blog.csdn.net/article/details/117931292)  
-[卡尔曼滤波 - 状态空间模型](https://flyfish.blog.csdn.net/article/details/118636364)  
-[卡尔曼滤波 - 5个公式出现的顺序](https://flyfish.blog.csdn.net/article/details/118709808)  
-
-
+- 若你的环境需要显式 AXCL 配置文件，可设置：`AXCL_JSON=/usr/bin/axcl/axcl.json`（不同系统路径可能不同）。
+- OSD 使用 **同一 track id 对应固定颜色**，便于观察跟踪一致性。

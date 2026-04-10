@@ -1,85 +1,45 @@
+#pragma once
 
-/*!
-    @Description : https://github.com/shaoshengsong/
-    @Author      : shaoshengsong
-    @Date        : 2022-09-21 02:39:47
-*/
 #include "model.h"
-#include "dataType.h"
-#include <chrono>
-#include <cmath>
-#include <exception>
-#include <fstream>
-#include <iostream>
-#include <limits>
-#include <numeric>
+#include "reid_feature_extractor.hpp"
+
+#include "SimpleCV.hpp"
+
 #include <string>
-#include <vector>
-#include <stdexcept> 
-#include <onnxruntime_cxx_api.h>
-#include "opencv2/opencv.hpp"
-#include "opencv2/core/core.hpp"
-#include <opencv2/dnn/dnn.hpp>
-#include <opencv2/imgcodecs.hpp>
-#include <opencv2/imgproc.hpp>
-typedef unsigned char uint8;
 
-template <typename T>
-T vectorProduct(const std::vector<T> &v)
-{
-    return std::accumulate(v.begin(), v.end(), 1, std::multiplies<T>());
-}
-
-template <typename T>
-std::ostream &operator<<(std::ostream &os, const std::vector<T> &v)
-{
-    os << "[";
-    for (int i = 0; i < v.size(); ++i)
-    {
-        os << v[i];
-        if (i != v.size() - 1)
-        {
-            os << ", ";
-        }
-    }
-    os << "]";
-    return os;
-}
-class FeatureTensor
-{
+// NPU-native ReID feature extractor for DeepSORT.
+//
+// - No OpenCV / onnxruntime dependency.
+// - Expects model output dim == k_feature_dim.
+class FeatureTensor {
 public:
-    static FeatureTensor *getInstance();
-    bool getRectsFeature(const cv::Mat &img, DETECTIONS &d);
-    void preprocess(cv::Mat &imageBGR, std::vector<float> &inputTensorValues, size_t &inputTensorSize);
+    static FeatureTensor* getInstance();
+
+    // Initialize ReID axmodel. Must be called before getRectsFeature().
+    // color_order: "rgb" (default) or "bgr" for model input pixels.
+    bool init(const std::string& model_path,
+              const std::string& color_order = "rgb",
+              int device_id = -1,
+              std::string* error = nullptr);
+
+    void deinit();
+
+    // Fill detection.feature for each detection. Detections with failed feature extraction are dropped.
+    bool getRectsFeature(const SimpleCV::Mat& bgr, DETECTIONS& d, std::string* error = nullptr);
+
+    int input_width() const noexcept { return input_w_; }
+    int input_height() const noexcept { return input_h_; }
 
 private:
-    FeatureTensor();
-    FeatureTensor(const FeatureTensor &);
-    FeatureTensor &operator=(const FeatureTensor &);
-    static FeatureTensor *instance;
-    bool init();
-    ~FeatureTensor();
+    FeatureTensor() = default;
+    FeatureTensor(const FeatureTensor&) = delete;
+    FeatureTensor& operator=(const FeatureTensor&) = delete;
+    ~FeatureTensor() = default;
 
-    void tobuffer(const std::vector<cv::Mat> &imgs, uint8 *buf);
+    static FeatureTensor* instance;
 
-public:
-    void test();
-
-    static constexpr const int width_ = 64;
-    static constexpr const int height_ = 128;
-
-    std::array<float, width_ * height_> input_image_{};
-
-    std::array<float, k_feature_dim> results_{};
-
-    Ort::Env env;
-    Ort::Session session_{env, k_feature_model_path.c_str(), Ort::SessionOptions{nullptr}};
-
-    Ort::Value input_tensor_{nullptr};
-    std::array<int64_t, 4> input_shape_{1, 3, width_, height_};
-
-    Ort::Value output_tensor_{nullptr};
-    std::array<int64_t, 2> output_shape_{1, k_feature_dim};
-
-    std::vector<int64_t> inputDims_;
+    bool inited_{false};
+    int input_w_{0};
+    int input_h_{0};
+    deepsort::npu::ReidFeatureExtractor extractor_{};
 };
