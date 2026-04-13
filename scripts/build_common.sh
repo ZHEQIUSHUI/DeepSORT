@@ -111,6 +111,33 @@ if [[ "${CHIP}" == axcl-* ]]; then
         echo "AXCL root not found for ${CHIP}; set DEEPSORT_AXCL_DIR, provide ${MSP_ZIP_PATH}, or install AXCL under /usr" >&2
         exit 1
     fi
+
+    # Some AXCL SDK zips store symlinks as empty placeholder files (e.g. libspdlog.so.1.14).
+    # Fix them up so cross-linking can locate transitive dependencies correctly.
+    AXCL_LIBDIR=""
+    if [[ -d "${AXCL_ROOT}/lib/axcl" ]]; then
+        AXCL_LIBDIR="${AXCL_ROOT}/lib/axcl"
+    elif [[ -d "${AXCL_ROOT}/lib" ]]; then
+        AXCL_LIBDIR="${AXCL_ROOT}/lib"
+    elif [[ -d "${AXCL_ROOT}/lib64" ]]; then
+        AXCL_LIBDIR="${AXCL_ROOT}/lib64"
+    fi
+
+    if [[ -n "${AXCL_LIBDIR}" ]]; then
+        SPDLOG_REAL="$(ls -1 "${AXCL_LIBDIR}"/libspdlog.so.*.*.* 2>/dev/null | sort -V | tail -n 1 || true)"
+        if [[ -n "${SPDLOG_REAL}" ]]; then
+            SPDLOG_REAL_BASENAME="$(basename "${SPDLOG_REAL}")"
+
+            if [[ -e "${AXCL_LIBDIR}/libspdlog.so" && ! -s "${AXCL_LIBDIR}/libspdlog.so" ]]; then
+                rm -f "${AXCL_LIBDIR}/libspdlog.so"
+                ln -s "${SPDLOG_REAL_BASENAME}" "${AXCL_LIBDIR}/libspdlog.so"
+            fi
+            if [[ -e "${AXCL_LIBDIR}/libspdlog.so.1.14" && ! -s "${AXCL_LIBDIR}/libspdlog.so.1.14" ]]; then
+                rm -f "${AXCL_LIBDIR}/libspdlog.so.1.14"
+                ln -s "${SPDLOG_REAL_BASENAME}" "${AXCL_LIBDIR}/libspdlog.so.1.14"
+            fi
+        fi
+    fi
 else
     if [[ ! -f "${MSP_ZIP_PATH}" ]]; then
         echo "missing MSP zip: ${MSP_ZIP_PATH}" >&2

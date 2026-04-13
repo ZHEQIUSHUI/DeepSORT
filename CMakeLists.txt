@@ -69,6 +69,14 @@ if(DEEPSORT_ENABLE_AXCL)
     target_include_directories(deepsort_npu_runner PUBLIC "${DEEPSORT_AXCL_DIR}/include" "${DEEPSORT_AXCL_DIR}/include/axcl")
     find_library(DEEPSORT_AXCL_RT_LIB axcl_rt HINTS "${DEEPSORT_AXCL_DIR}/lib/axcl" "${DEEPSORT_AXCL_DIR}/lib" "${DEEPSORT_AXCL_DIR}/lib64" REQUIRED)
     target_link_libraries(deepsort_npu_runner PUBLIC "${DEEPSORT_AXCL_RT_LIB}")
+    foreach(_axcl_libdir "${DEEPSORT_AXCL_DIR}/lib/axcl" "${DEEPSORT_AXCL_DIR}/lib" "${DEEPSORT_AXCL_DIR}/lib64")
+        if(EXISTS "${_axcl_libdir}")
+            # When DEEPSORT_AXCL_DIR is an extracted SDK (esp. cross-build), make sure the linker can
+            # locate libaxcl_rt's transitive shared-library dependencies (libaxcl_pkg, libaxcl_comm,
+            # libspdlog, ...).
+            target_link_options(deepsort_npu_runner PUBLIC "-Wl,-rpath-link=${_axcl_libdir}")
+        endif()
+    endforeach()
 endif()
 
 if(DEEPSORT_ENABLE_AX650)
