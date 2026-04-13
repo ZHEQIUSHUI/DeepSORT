@@ -55,6 +55,9 @@ make -j
 
 效果示例（AX650 实测输出）：
 
+https://github.com/user-attachments/assets/3f70cb33-d75c-41f8-8065-aeb998ba9eb0
+
+
 
 参数说明（节选）：
 
