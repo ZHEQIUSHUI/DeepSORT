@@ -91,7 +91,7 @@ if [[ "${CHIP}" == axcl-* ]]; then
             if [[ -d "${MSP_EXTRACT_DIR}/${AXCL_SUBDIR_NAME}" ]]; then
                 AXCL_ROOT="${MSP_EXTRACT_DIR}/${AXCL_SUBDIR_NAME}"
             else
-                DETECTED_AXCL_ROOT="$(find "${MSP_EXTRACT_DIR}" -maxdepth 4 \( -path "*/${AXCL_SUBDIR_NAME}/include/axcl.h" -o -path "*/${AXCL_SUBDIR_NAME}/include/axcl/axcl.h" \) | head -n 1 || true)"
+                DETECTED_AXCL_ROOT="$(find "${MSP_EXTRACT_DIR}" -maxdepth 5 \( -path "*/${AXCL_SUBDIR_NAME}/include/axcl.h" -o -path "*/${AXCL_SUBDIR_NAME}/include/axcl/axcl.h" \) | head -n 1 || true)"
                 if [[ "${DETECTED_AXCL_ROOT}" == */include/axcl/axcl.h ]]; then
                     AXCL_ROOT="${DETECTED_AXCL_ROOT%/include/axcl/axcl.h}"
                 elif [[ "${DETECTED_AXCL_ROOT}" == */include/axcl.h ]]; then
