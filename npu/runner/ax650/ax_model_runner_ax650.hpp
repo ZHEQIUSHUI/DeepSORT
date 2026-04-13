@@ -24,6 +24,15 @@ public:
     int sync_output(int grpid, int idx) override;
     int sync_output(int grpid, std::string name) override;
 
+    // Bind external CMM/pool buffers as model I/O (device-input style).
+    // The physical address must be accessible by AX_ENGINE and must have a valid virtual mapping
+    // (AX_SYS_MemGetBlockInfoByPhy must succeed).
+    int set_input(int grpid, int idx, unsigned long long int phy_addr, unsigned long size);
+    int set_output(int grpid, int idx, unsigned long long int phy_addr, unsigned long size);
+
+    int set_input(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size);
+    int set_output(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size);
+
     int inference() override;
     int inference(int grpid) override;
 };

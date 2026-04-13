@@ -45,7 +45,7 @@ public:
     bool Extract(const SimpleCV::Mat& bgr, std::vector<float>* feature, std::string* error);
 
     // Fast path: the input is already in model expected layout and dtype, and lives in device memory.
-    // Currently supported for AXCL backend only.
+    // Supported for AXCL/AX650 backends.
     bool ExtractFromDevice(std::uint64_t device_addr,
                            std::size_t device_bytes,
                            std::vector<float>* feature,

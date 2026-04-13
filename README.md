@@ -53,6 +53,9 @@ make -j
   --device_id 0
 ```
 
+效果示例（AX650 实测输出）：
+
+
 参数说明（节选）：
 
 - `--yolo_type`：`yolov5|yolov8`

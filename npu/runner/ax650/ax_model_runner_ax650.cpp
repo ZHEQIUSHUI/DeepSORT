@@ -96,12 +96,14 @@ static inline int prepare_io(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data,
     std::memset(io_data, 0, sizeof(*io_data));
     io_data->pInputs = new AX_ENGINE_IO_BUFFER_T[info->nInputSize];
     io_data->nInputSize = info->nInputSize;
+    std::memset(io_data->pInputs, 0, sizeof(AX_ENGINE_IO_BUFFER_T) * info->nInputSize);
 
     auto ret = 0;
     for (uint i = 0; i < info->nInputSize; ++i)
     {
         auto meta = info->pInputs[i];
         auto buffer = &io_data->pInputs[i];
+        buffer->nSize = meta.nSize;
         if (strategy.first == AX_ENGINE_ABST_CACHED)
         {
             ret = AX_SYS_MemAllocCached((AX_U64 *)(&buffer->phyAddr), &buffer->pVirAddr, meta.nSize, AX_CMM_ALIGN_SIZE, (const AX_S8 *)(AX_CMM_SESSION_NAME));
@@ -122,6 +124,7 @@ static inline int prepare_io(AX_ENGINE_IO_INFO_T *info, AX_ENGINE_IO_T *io_data,
 
     io_data->pOutputs = new AX_ENGINE_IO_BUFFER_T[info->nOutputSize];
     io_data->nOutputSize = info->nOutputSize;
+    std::memset(io_data->pOutputs, 0, sizeof(AX_ENGINE_IO_BUFFER_T) * info->nOutputSize);
     for (uint i = 0; i < info->nOutputSize; ++i)
     {
         auto meta = info->pOutputs[i];
@@ -302,6 +305,106 @@ int ax_runner_ax650::set_affinity(int id)
     return AX_ENGINE_SetAffinity(m_handle->handle, id);
 }
 
+int ax_runner_ax650::set_input(int grpid, int idx, unsigned long long int phy_addr, unsigned long size)
+{
+    if (!m_handle) return -1;
+    if (grpid < 0 || static_cast<size_t>(grpid) >= m_handle->io_data.size()) return -1;
+    auto &io = m_handle->io_data[static_cast<size_t>(grpid)];
+    if (idx < 0 || static_cast<AX_U32>(idx) >= io.nInputSize) return -1;
+    if (phy_addr == 0 || size == 0) return -1;
+
+    AX_S32 mem_type = 0;
+    AX_VOID *vir = nullptr;
+    AX_U32 block_size = 0;
+    const AX_S32 ret = AX_SYS_MemGetBlockInfoByPhy(static_cast<AX_U64>(phy_addr), &mem_type, &vir, &block_size);
+    (void)mem_type;
+    if (ret != AX_SUCCESS || vir == nullptr) {
+        ALOGE("AX_SYS_MemGetBlockInfoByPhy failed ret=%d phy=0x%llx", ret, phy_addr);
+        return -1;
+    }
+    if (block_size < static_cast<AX_U32>(size)) {
+        ALOGE("AX_SYS_MemGetBlockInfoByPhy block too small block=%u need=%lu", block_size, size);
+        return -1;
+    }
+
+    io.pInputs[idx].phyAddr = static_cast<AX_U64>(phy_addr);
+    io.pInputs[idx].pVirAddr = vir;
+    io.pInputs[idx].nSize = static_cast<AX_U32>(size);
+
+    if (grpid >= 0 && static_cast<size_t>(grpid) < mgroup_input_tensors.size() &&
+        idx >= 0 && static_cast<size_t>(idx) < mgroup_input_tensors[static_cast<size_t>(grpid)].size()) {
+        auto& tensor = mgroup_input_tensors[static_cast<size_t>(grpid)][static_cast<size_t>(idx)];
+        tensor.phyAddr = static_cast<unsigned long>(phy_addr);
+        tensor.pVirAddr = vir;
+        tensor.nSize = static_cast<int>(size);
+    }
+    if (grpid == 0 && idx >= 0 && static_cast<size_t>(idx) < minput_tensors.size()) {
+        auto& tensor = minput_tensors[static_cast<size_t>(idx)];
+        tensor.phyAddr = static_cast<unsigned long>(phy_addr);
+        tensor.pVirAddr = vir;
+        tensor.nSize = static_cast<int>(size);
+    }
+    map_input_tensors.clear();
+    map_group_input_tensors.clear();
+    return 0;
+}
+
+int ax_runner_ax650::set_output(int grpid, int idx, unsigned long long int phy_addr, unsigned long size)
+{
+    if (!m_handle) return -1;
+    if (grpid < 0 || static_cast<size_t>(grpid) >= m_handle->io_data.size()) return -1;
+    auto &io = m_handle->io_data[static_cast<size_t>(grpid)];
+    if (idx < 0 || static_cast<AX_U32>(idx) >= io.nOutputSize) return -1;
+    if (phy_addr == 0 || size == 0) return -1;
+
+    AX_S32 mem_type = 0;
+    AX_VOID *vir = nullptr;
+    AX_U32 block_size = 0;
+    const AX_S32 ret = AX_SYS_MemGetBlockInfoByPhy(static_cast<AX_U64>(phy_addr), &mem_type, &vir, &block_size);
+    (void)mem_type;
+    if (ret != AX_SUCCESS || vir == nullptr) {
+        ALOGE("AX_SYS_MemGetBlockInfoByPhy failed ret=%d phy=0x%llx", ret, phy_addr);
+        return -1;
+    }
+    if (block_size < static_cast<AX_U32>(size)) {
+        ALOGE("AX_SYS_MemGetBlockInfoByPhy block too small block=%u need=%lu", block_size, size);
+        return -1;
+    }
+
+    io.pOutputs[idx].phyAddr = static_cast<AX_U64>(phy_addr);
+    io.pOutputs[idx].pVirAddr = vir;
+    io.pOutputs[idx].nSize = static_cast<AX_U32>(size);
+
+    if (grpid >= 0 && static_cast<size_t>(grpid) < mgroup_output_tensors.size() &&
+        idx >= 0 && static_cast<size_t>(idx) < mgroup_output_tensors[static_cast<size_t>(grpid)].size()) {
+        auto& tensor = mgroup_output_tensors[static_cast<size_t>(grpid)][static_cast<size_t>(idx)];
+        tensor.phyAddr = static_cast<unsigned long>(phy_addr);
+        tensor.pVirAddr = vir;
+        tensor.nSize = static_cast<int>(size);
+    }
+    if (grpid == 0 && idx >= 0 && static_cast<size_t>(idx) < moutput_tensors.size()) {
+        auto& tensor = moutput_tensors[static_cast<size_t>(idx)];
+        tensor.phyAddr = static_cast<unsigned long>(phy_addr);
+        tensor.pVirAddr = vir;
+        tensor.nSize = static_cast<int>(size);
+    }
+    map_output_tensors.clear();
+    map_group_output_tensors.clear();
+    return 0;
+}
+
+int ax_runner_ax650::set_input(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size)
+{
+    const auto &t = get_input(grpid, name);
+    return set_input(grpid, t.nIdx, phy_addr, size);
+}
+
+int ax_runner_ax650::set_output(int grpid, std::string name, unsigned long long int phy_addr, unsigned long size)
+{
+    const auto &t = get_output(grpid, name);
+    return set_output(grpid, t.nIdx, phy_addr, size);
+}
+
 int ax_runner_ax650::sync_output(int idx)
 {
     auto &tensor = get_output(idx);
@@ -357,6 +460,10 @@ int ax_runner_ax650::inference(int grpid)
 int ax_runner_ax650::init(const void *, unsigned int, int) { return -1; }
 void ax_runner_ax650::deinit() {}
 int ax_runner_ax650::set_affinity(int) { return -1; }
+int ax_runner_ax650::set_input(int, int, unsigned long long int, unsigned long) { return -1; }
+int ax_runner_ax650::set_output(int, int, unsigned long long int, unsigned long) { return -1; }
+int ax_runner_ax650::set_input(int, std::string, unsigned long long int, unsigned long) { return -1; }
+int ax_runner_ax650::set_output(int, std::string, unsigned long long int, unsigned long) { return -1; }
 int ax_runner_ax650::sync_output(int) { return -1; }
 int ax_runner_ax650::sync_output(std::string) { return -1; }
 int ax_runner_ax650::sync_output(int, int) { return -1; }

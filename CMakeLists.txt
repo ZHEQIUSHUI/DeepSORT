@@ -154,6 +154,8 @@ if(DEEPSORT_ENABLE_AX_VIDEO_SDK AND DEEPSORT_BUILD_DEMO_AXVSDK AND (DEEPSORT_ENA
             deepsort_tracker
             ax_video_sdk::ax_video_sdk
     )
+    # The demo optionally uses a few ax-video-sdk internal helpers for device-side frame copy + metadata.
+    target_include_directories(demo_axvsdk_deepsort PRIVATE ${CMAKE_SOURCE_DIR}/third_party/ax-video-sdk/src)
     if(DEEPSORT_ENABLE_AX650 AND UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
         # AX650 MSP libraries (e.g. libax_venc.so) may contain unresolved libexif symbols.
         # Keep the demo link step aligned with ax-video-sdk internal tools.

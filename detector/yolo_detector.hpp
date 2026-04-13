@@ -75,7 +75,7 @@ public:
     void Deinit();
 
     bool Detect(const SimpleCV::Mat& bgr, std::vector<Detection>* out, std::string* error);
-    // Device-input inference for AXCL (zero-copy style).
+    // Device-input inference for AXCL/AX650 (zero-copy style).
     // The device buffer must already be in the model's expected input format and size.
     bool DetectFromDevice(std::uint64_t device_addr,
                           std::size_t device_bytes,

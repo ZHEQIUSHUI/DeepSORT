@@ -475,41 +475,70 @@ bool ReidFeatureExtractor::ExtractFromDevice(std::uint64_t device_addr,
         return false;
     }
 
+    ax_runner_axcl* axcl_runner = nullptr;
+    ax_runner_ax650* ax650_runner = nullptr;
 #if defined(DEEPSORT_HAVE_AXCL)
-    auto* axcl_runner = dynamic_cast<ax_runner_axcl*>(impl_->runner.get());
-    if (axcl_runner == nullptr) {
-        if (error) *error = "device input only supported by AXCL backend";
+    axcl_runner = dynamic_cast<ax_runner_axcl*>(impl_->runner.get());
+#endif
+#if defined(DEEPSORT_HAVE_AX650)
+    ax650_runner = dynamic_cast<ax_runner_ax650*>(impl_->runner.get());
+#endif
+    if (axcl_runner == nullptr && ax650_runner == nullptr) {
+        if (error) *error = "device input only supported by AXCL/AX650 backends";
         return false;
     }
 
-    struct RestoreGuard {
+    struct AxclRestoreGuard {
         ax_runner_axcl* r{nullptr};
         bool prev_before{true};
         std::uint64_t default_dev{0};
         unsigned long size{0};
-        ~RestoreGuard() {
+        ~AxclRestoreGuard() {
             if (!r) return;
             if (default_dev != 0 && size != 0) {
                 (void)r->set_input(0, 0, default_dev, size);
             }
             r->set_auto_sync_before_inference(prev_before);
         }
-    } guard{};
+    } axcl_guard{};
 
-    guard.r = axcl_runner;
-    guard.prev_before = axcl_runner->auto_sync_before_inference();
-    guard.default_dev = static_cast<std::uint64_t>(in.phyAddr);
-    guard.size = static_cast<unsigned long>(in.nSize);
+    struct Ax650RestoreGuard {
+        ax_runner_ax650* r{nullptr};
+        std::uint64_t default_phy{0};
+        unsigned long size{0};
+        ~Ax650RestoreGuard() {
+            if (!r) return;
+            if (default_phy != 0 && size != 0) {
+                (void)r->set_input(0, 0, default_phy, size);
+            }
+        }
+    } ax650_guard{};
 
-    axcl_runner->set_auto_sync_before_inference(false);
-    if (axcl_runner->set_input(0, 0, device_addr, guard.size) != 0) {
-        if (error) *error = "axcl set_input failed";
-        return false;
-    }
-#else
-    if (error) *error = "device input not enabled in this build";
-    return false;
+    if (axcl_runner != nullptr) {
+#if defined(DEEPSORT_HAVE_AXCL)
+        axcl_guard.r = axcl_runner;
+        axcl_guard.prev_before = axcl_runner->auto_sync_before_inference();
+        axcl_guard.default_dev = static_cast<std::uint64_t>(in.phyAddr);
+        axcl_guard.size = static_cast<unsigned long>(in.nSize);
+
+        axcl_runner->set_auto_sync_before_inference(false);
+        if (axcl_runner->set_input(0, 0, device_addr, axcl_guard.size) != 0) {
+            if (error) *error = "axcl set_input failed";
+            return false;
+        }
 #endif
+    } else if (ax650_runner != nullptr) {
+#if defined(DEEPSORT_HAVE_AX650)
+        ax650_guard.r = ax650_runner;
+        ax650_guard.default_phy = static_cast<std::uint64_t>(in.phyAddr);
+        ax650_guard.size = static_cast<unsigned long>(in.nSize);
+
+        if (ax650_runner->set_input(0, 0, device_addr, ax650_guard.size) != 0) {
+            if (error) *error = "ax650 set_input failed";
+            return false;
+        }
+#endif
+    }
 
     const int ret = runner.inference();
     if (ret != 0) {

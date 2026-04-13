@@ -5,9 +5,18 @@
 #include "tracker/deepsort/include/tracker.h"
 #include "tracker/deepsort/include/reid_feature_extractor.hpp"
 
+#include "codec/ax_video_decoder.h"
+#include "codec/ax_video_encoder.h"
+#include "common/ax_drawer.h"
 #include "common/ax_image_processor.h"
 #include "common/ax_system.h"
-#include "pipeline/ax_pipeline.h"
+#include "pipeline/ax_demuxer.h"
+#include "pipeline/ax_muxer.h"
+
+// Pull internal helpers from ax-video-sdk for zero-copy device-side frame copy + metadata preservation on AX650.
+// This keeps the demo OSD fully aligned with the encoded frame (no pipeline async OSD lag).
+#include "common/ax_image_copy.h"
+#include "common/ax_image_internal.h"
 
 #include "cmdline.hpp"
 
@@ -184,7 +193,7 @@ int main(int argc, char** argv) {
     }
 
     const bool use_device_input =
-#if defined(DEEPSORT_HAVE_AXCL)
+#if defined(DEEPSORT_HAVE_AXCL) || defined(DEEPSORT_HAVE_AX650)
         true;
 #else
         false;
@@ -219,58 +228,83 @@ int main(int argc, char** argv) {
         return 5;
     }
 
-    auto pipeline = axvsdk::pipeline::CreatePipeline();
-    if (!pipeline) {
-        std::cerr << "[demo_axvsdk_deepsort] CreatePipeline failed\n";
+    auto drawer = axvsdk::common::CreateDrawer();
+    if (!drawer) {
+        std::cerr << "[demo_axvsdk_deepsort] CreateDrawer failed\n";
         return 6;
     }
 
-    axvsdk::pipeline::PipelineConfig cfg{};
-    cfg.device_id = device_id;
-    cfg.input.uri = input_path;
-    cfg.input.realtime_playback = true;
-    cfg.input.loop_playback = false;
-
-    axvsdk::pipeline::PipelineOutputConfig out{};
-    out.codec = axvsdk::codec::VideoCodecType::kH265;
-    out.uris.push_back(output_path);
-    cfg.outputs.push_back(out);
-
-    // Frame output: prefer zero-copy NV12 decoded frames.
-    cfg.frame_output.output_image.format = axvsdk::common::PixelFormat::kNv12;
-
-    if (!pipeline->Open(cfg)) {
-        std::cerr << "[demo_axvsdk_deepsort] pipeline Open failed\n";
-        return 6;
-    }
-    if (!pipeline->Start()) {
-        std::cerr << "[demo_axvsdk_deepsort] pipeline Start failed\n";
-        pipeline->Close();
+    auto demuxer = axvsdk::pipeline::CreateDemuxer();
+    auto decoder = axvsdk::codec::CreateVideoDecoder();
+    auto encoder = axvsdk::codec::CreateVideoEncoder();
+    auto muxer = axvsdk::pipeline::CreateMuxer();
+    if (!demuxer || !decoder || !encoder || !muxer) {
+        std::cerr << "[demo_axvsdk_deepsort] create ax-video-sdk components failed\n";
         return 6;
     }
 
-    struct PipelineGuard {
-        axvsdk::pipeline::Pipeline* p{nullptr};
-        ~PipelineGuard() {
-            if (p) {
-                p->Stop();
-                p->Close();
-            }
-        }
-    } pipeline_guard{pipeline.get()};
+    axvsdk::pipeline::DemuxerConfig demux_cfg{};
+    demux_cfg.uri = input_path;
+    demux_cfg.realtime_playback = true;
+    demux_cfg.loop_playback = false;
+    if (!demuxer->Open(demux_cfg)) {
+        std::cerr << "[demo_axvsdk_deepsort] demuxer Open failed\n";
+        return 6;
+    }
 
-    std::mutex frame_mu;
-    std::condition_variable frame_cv;
-    axvsdk::common::AxImage::Ptr latest_frame;
-    std::uint64_t latest_seq = 0;
+    const auto stream_info = demuxer->GetVideoStreamInfo();
+    if ((stream_info.codec != axvsdk::codec::VideoCodecType::kH264 &&
+         stream_info.codec != axvsdk::codec::VideoCodecType::kH265) ||
+        stream_info.width == 0 || stream_info.height == 0) {
+        std::cerr << "[demo_axvsdk_deepsort] unsupported input stream\n";
+        return 6;
+    }
 
-    pipeline->SetFrameCallback([&](axvsdk::common::AxImage::Ptr frame) {
-        if (!frame) return;
-        std::lock_guard<std::mutex> lock(frame_mu);
-        latest_frame = std::move(frame);
-        ++latest_seq;
-        frame_cv.notify_one();
-    });
+    axvsdk::codec::VideoDecoderConfig decoder_cfg{};
+    decoder_cfg.stream = stream_info;
+    decoder_cfg.device_id = device_id;
+    decoder_cfg.output_image.format = axvsdk::common::PixelFormat::kNv12;
+    if (!decoder->Open(decoder_cfg)) {
+        std::cerr << "[demo_axvsdk_deepsort] decoder Open failed\n";
+        return 6;
+    }
+
+    axvsdk::codec::VideoEncoderConfig encoder_cfg{};
+    encoder_cfg.codec = axvsdk::codec::VideoCodecType::kH265;
+    encoder_cfg.width = stream_info.width;
+    encoder_cfg.height = stream_info.height;
+    encoder_cfg.device_id = device_id;
+    encoder_cfg.frame_rate = stream_info.frame_rate > 0.0 ? stream_info.frame_rate : 30.0;
+    encoder_cfg.gop = 0;
+    encoder_cfg.bitrate_kbps = 0;
+    encoder_cfg.input_queue_depth = 10;
+    encoder_cfg.overflow_policy = axvsdk::codec::QueueOverflowPolicy::kDropOldest;
+    if (!encoder->Open(encoder_cfg)) {
+        std::cerr << "[demo_axvsdk_deepsort] encoder Open failed\n";
+        decoder->Close();
+        return 6;
+    }
+
+    axvsdk::pipeline::MuxerConfig mux_cfg{};
+    mux_cfg.stream.codec = encoder_cfg.codec;
+    mux_cfg.stream.width = encoder_cfg.width;
+    mux_cfg.stream.height = encoder_cfg.height;
+    mux_cfg.stream.frame_rate = encoder_cfg.frame_rate;
+    mux_cfg.uris.push_back(output_path);
+    if (!muxer->Open(mux_cfg)) {
+        std::cerr << "[demo_axvsdk_deepsort] muxer Open failed\n";
+        encoder->Close();
+        decoder->Close();
+        return 6;
+    }
+
+    std::atomic<std::uint64_t> decoded_frames{0};
+    std::atomic<std::uint64_t> processed_frames{0};
+    std::atomic<std::uint64_t> submitted_frames{0};
+    std::atomic<std::uint64_t> dropped_frames{0};
+    std::atomic<std::uint64_t> encoded_packets{0};
+    std::atomic<bool> stop_requested{false};
+    std::atomic<bool> feed_reached_eos{false};
 
     // DeepSORT params (same as original main.cpp)
     const int nn_budget = 100;
@@ -279,225 +313,297 @@ int main(int argc, char** argv) {
 
     const std::uint32_t bg_rgb = BackgroundBgrToRgb(det_opt.background);
 
-    std::uint64_t seen_seq = 0;
-    std::uint64_t processed_frames = 0;
-    auto last_progress = std::chrono::steady_clock::now();
-    axvsdk::pipeline::PipelineStats last_stats{};
-    std::uint64_t last_encoded_packets = 0;
+    encoder->SetPacketCallback([&](axvsdk::codec::EncodedPacket packet) {
+        if (muxer) {
+            (void)muxer->SubmitPacket(packet);
+        }
+        encoded_packets.fetch_add(1, std::memory_order_relaxed);
+    });
+
     axvsdk::common::AxImage::Ptr frame_bgr;
-
-    while (true) {
-        axvsdk::common::AxImage::Ptr frame;
-        {
-            std::unique_lock<std::mutex> lock(frame_mu);
-            frame_cv.wait_for(lock, std::chrono::milliseconds(50), [&] { return latest_seq != seen_seq; });
-            if (latest_seq != seen_seq) {
-                seen_seq = latest_seq;
-                frame = latest_frame;
+    decoder->SetFrameCallback(
+        [&](axvsdk::common::AxImage::Ptr frame) {
+            if (!frame) return;
+            decoded_frames.fetch_add(1, std::memory_order_relaxed);
+            if (stop_requested.load(std::memory_order_relaxed)) {
+                return;
             }
-        }
-
-        // Periodically check for pipeline idle (end of stream).
-        const auto stats = pipeline->GetStats();
-        const std::uint64_t encoded_packets =
-            (!stats.output_stats.empty() ? stats.output_stats.front().encoded_packets : 0ULL);
-        if (stats.decoded_frames != last_stats.decoded_frames || encoded_packets != last_encoded_packets) {
-            last_progress = std::chrono::steady_clock::now();
-            last_stats = stats;
-            last_encoded_packets = encoded_packets;
-        }
-
-        const auto idle = std::chrono::steady_clock::now() - last_progress;
-        if (idle > std::chrono::seconds(2) && processed_frames > 0) {
-            break;
-        }
-
-        if (!frame) {
-            continue;
-        }
-
-        std::vector<deepsort::detector::Detection> dets;
-        if (use_device_input) {
-            // 1) Preprocess for YOLO using hardware IVPS (letterbox + CSC if needed).
-            axvsdk::common::ImageProcessRequest det_req{};
-            det_req.output_image.format = det_fmt;
-            det_req.output_image.width = static_cast<std::uint32_t>(detector.input_width());
-            det_req.output_image.height = static_cast<std::uint32_t>(detector.input_height());
-            det_req.resize.mode = axvsdk::common::ResizeMode::kKeepAspectRatio;
-            det_req.resize.horizontal_align = axvsdk::common::ResizeAlign::kCenter;
-            det_req.resize.vertical_align = axvsdk::common::ResizeAlign::kCenter;
-            det_req.resize.background_color = bg_rgb;
-            if (!processor->Process(*frame, det_req, *det_input)) {
-                std::cerr << "[demo_axvsdk_deepsort] det preprocess failed\n";
-                return 7;
+            if (max_frames > 0 && processed_frames.load(std::memory_order_relaxed) >= static_cast<std::uint64_t>(max_frames)) {
+                stop_requested.store(true, std::memory_order_relaxed);
+                return;
             }
 
-            // 2) YOLO inference (device input, AXCL only).
-            if (!detector.DetectFromDevice(det_input->physical_address(0),
-                                           det_input->byte_size(),
-                                           static_cast<int>(frame->width()),
-                                           static_cast<int>(frame->height()),
-                                           &dets,
-                                           &err)) {
-                std::cerr << "[demo_axvsdk_deepsort] detect failed: " << err << "\n";
-                return 7;
-            }
-        } else {
-            // AX650/MSP path: convert frame to BGR and run the standard detector path.
-            if (!frame_bgr || frame_bgr->width() != frame->width() || frame_bgr->height() != frame->height()) {
-                frame_bgr = axvsdk::common::AxImage::Create(axvsdk::common::PixelFormat::kBgr24, frame->width(),
-                                                           frame->height());
-                if (!frame_bgr) {
-                    std::cerr << "[demo_axvsdk_deepsort] create frame_bgr failed\n";
-                    return 7;
-                }
-            }
-
-            axvsdk::common::ImageProcessRequest det_req{};
-            det_req.output_image.format = axvsdk::common::PixelFormat::kBgr24;
-            det_req.output_image.width = frame->width();
-            det_req.output_image.height = frame->height();
-            det_req.resize.mode = axvsdk::common::ResizeMode::kStretch;
-            if (!processor->Process(*frame, det_req, *frame_bgr)) {
-                std::cerr << "[demo_axvsdk_deepsort] det CSC failed\n";
-                return 7;
-            }
-
-            SimpleCV::Mat frame_mat(static_cast<int>(frame_bgr->height()), static_cast<int>(frame_bgr->width()), 3,
-                                    static_cast<unsigned char*>(frame_bgr->virtual_address(0)),
-                                    frame_bgr->stride(0));
-            if (!detector.Detect(frame_mat, &dets, &err)) {
-                std::cerr << "[demo_axvsdk_deepsort] detect failed: " << err << "\n";
-                return 7;
-            }
-        }
-
-        // 3) Prepare DeepSORT detections with ReID features.
-        DETECTIONS detections;
-        detections.reserve(dets.size());
-
-        for (const auto& d : dets) {
-            if (d.class_id != 0) continue;  // person
-            const float w0 = std::max(0.0F, d.x1 - d.x0);
-            const float h0 = std::max(0.0F, d.y1 - d.y0);
-            if (w0 <= 1.0F || h0 <= 1.0F) continue;
-
-            axvsdk::common::CropRect crop{};
-            if (!MakeReidCropRect(*frame, d.x0, d.y0, w0, h0, &crop)) {
-                continue;
-            }
-
-            axvsdk::common::ImageProcessRequest reid_req{};
-            reid_req.enable_crop = true;
-            reid_req.crop = crop;
-            reid_req.output_image.format = reid_fmt;
-            reid_req.output_image.width = static_cast<std::uint32_t>(reid.input_width());
-            reid_req.output_image.height = static_cast<std::uint32_t>(reid.input_height());
-            reid_req.resize.mode = axvsdk::common::ResizeMode::kStretch;
-
-            if (!processor->Process(*frame, reid_req, *reid_input)) {
-                continue;
-            }
-
-            std::vector<float> feat;
+            // 1) YOLO detect.
+            std::vector<deepsort::detector::Detection> dets;
             if (use_device_input) {
-                if (!reid.ExtractFromDevice(reid_input->physical_address(0), reid_input->byte_size(), &feat, &err) ||
-                    feat.size() != static_cast<std::size_t>(k_feature_dim)) {
-                    continue;
+                axvsdk::common::ImageProcessRequest det_req{};
+                det_req.output_image.format = det_fmt;
+                det_req.output_image.width = static_cast<std::uint32_t>(detector.input_width());
+                det_req.output_image.height = static_cast<std::uint32_t>(detector.input_height());
+                det_req.resize.mode = axvsdk::common::ResizeMode::kKeepAspectRatio;
+                det_req.resize.horizontal_align = axvsdk::common::ResizeAlign::kCenter;
+                det_req.resize.vertical_align = axvsdk::common::ResizeAlign::kCenter;
+                det_req.resize.background_color = bg_rgb;
+                if (!processor->Process(*frame, det_req, *det_input)) {
+                    return;
+                }
+
+                if (!detector.DetectFromDevice(det_input->physical_address(0),
+                                               det_input->byte_size(),
+                                               static_cast<int>(frame->width()),
+                                               static_cast<int>(frame->height()),
+                                               &dets,
+                                               &err)) {
+                    return;
                 }
             } else {
-                SimpleCV::Mat reid_mat(static_cast<int>(reid_input->height()), static_cast<int>(reid_input->width()), 3,
-                                       static_cast<unsigned char*>(reid_input->virtual_address(0)),
-                                       reid_input->stride(0));
-                if (!reid.Extract(reid_mat, &feat, &err) || feat.size() != static_cast<std::size_t>(k_feature_dim)) {
+                if (!frame_bgr || frame_bgr->width() != frame->width() || frame_bgr->height() != frame->height()) {
+                    frame_bgr = axvsdk::common::AxImage::Create(axvsdk::common::PixelFormat::kBgr24, frame->width(),
+                                                               frame->height());
+                    if (!frame_bgr) {
+                        return;
+                    }
+                }
+
+                axvsdk::common::ImageProcessRequest det_req{};
+                det_req.output_image.format = axvsdk::common::PixelFormat::kBgr24;
+                det_req.output_image.width = frame->width();
+                det_req.output_image.height = frame->height();
+                det_req.resize.mode = axvsdk::common::ResizeMode::kStretch;
+                if (!processor->Process(*frame, det_req, *frame_bgr)) {
+                    return;
+                }
+
+                SimpleCV::Mat frame_mat(static_cast<int>(frame_bgr->height()), static_cast<int>(frame_bgr->width()), 3,
+                                        static_cast<unsigned char*>(frame_bgr->virtual_address(0)),
+                                        frame_bgr->stride(0));
+                if (!detector.Detect(frame_mat, &dets, &err)) {
+                    return;
+                }
+            }
+
+            // 2) ReID + DeepSORT.
+            DETECTIONS detections;
+            detections.reserve(dets.size());
+            for (const auto& d : dets) {
+                if (d.class_id != 0) continue;
+                const float w0 = std::max(0.0F, d.x1 - d.x0);
+                const float h0 = std::max(0.0F, d.y1 - d.y0);
+                if (w0 <= 1.0F || h0 <= 1.0F) continue;
+
+                axvsdk::common::CropRect crop{};
+                if (!MakeReidCropRect(*frame, d.x0, d.y0, w0, h0, &crop)) {
                     continue;
                 }
+
+                axvsdk::common::ImageProcessRequest reid_req{};
+                reid_req.enable_crop = true;
+                reid_req.crop = crop;
+                reid_req.output_image.format = reid_fmt;
+                reid_req.output_image.width = static_cast<std::uint32_t>(reid.input_width());
+                reid_req.output_image.height = static_cast<std::uint32_t>(reid.input_height());
+                reid_req.resize.mode = axvsdk::common::ResizeMode::kStretch;
+                if (!processor->Process(*frame, reid_req, *reid_input)) {
+                    continue;
+                }
+
+                std::vector<float> feat;
+                if (use_device_input) {
+                    if (!reid.ExtractFromDevice(reid_input->physical_address(0), reid_input->byte_size(), &feat, &err) ||
+                        feat.size() != static_cast<std::size_t>(k_feature_dim)) {
+                        continue;
+                    }
+                } else {
+                    SimpleCV::Mat reid_mat(static_cast<int>(reid_input->height()), static_cast<int>(reid_input->width()), 3,
+                                           static_cast<unsigned char*>(reid_input->virtual_address(0)),
+                                           reid_input->stride(0));
+                    if (!reid.Extract(reid_mat, &feat, &err) || feat.size() != static_cast<std::size_t>(k_feature_dim)) {
+                        continue;
+                    }
+                }
+
+                DETECTION_ROW row;
+                row.tlwh = DETECTBOX(d.x0, d.y0, w0, h0);
+                row.confidence = d.score;
+                for (int i = 0; i < k_feature_dim; ++i) {
+                    row.feature[i] = feat[static_cast<std::size_t>(i)];
+                }
+                detections.push_back(std::move(row));
             }
 
-            DETECTION_ROW row;
-            row.tlwh = DETECTBOX(d.x0, d.y0, w0, h0);
-            row.confidence = d.score;
-            for (int i = 0; i < k_feature_dim; ++i) {
-                row.feature[i] = feat[static_cast<std::size_t>(i)];
+            trk.predict();
+            trk.update(detections);
+
+            // 3) Prepare an encoder frame (AX650: copy pool -> CMM to avoid chroma corruption in VENC).
+            axvsdk::common::AxImage::Ptr encoder_frame = frame;
+#if defined(AXSDK_CHIP_AX650)
+            if (encoder_frame && encoder_frame->memory_type() == axvsdk::common::MemoryType::kPool) {
+                axvsdk::common::ImageAllocationOptions alloc{};
+                alloc.memory_type = axvsdk::common::MemoryType::kCmm;
+                alloc.cache_mode = axvsdk::common::CacheMode::kNonCached;
+                alloc.alignment = 0x1000;
+                alloc.token = "DeepsortEncodeFrame";
+                auto copied = axvsdk::common::AxImage::Create(encoder_frame->descriptor(), alloc);
+                if (copied && axvsdk::common::internal::CopyImage(*encoder_frame, copied.get())) {
+                    axvsdk::common::internal::AxImageAccess::CopyFrameMetadata(*encoder_frame, copied.get());
+                    encoder_frame = std::move(copied);
+                }
             }
-            detections.push_back(std::move(row));
+#endif
+
+            // 4) Draw OSD in-place on the frame we will encode (no async lag).
+            axvsdk::common::DrawFrame draw{};
+            draw.hold_frames = 1;
+            const int frame_w = static_cast<int>(encoder_frame->width());
+            const int frame_h = static_cast<int>(encoder_frame->height());
+
+            for (Track& t : trk.tracks) {
+                if (!t.is_confirmed() || t.time_since_update > 1) continue;
+                const DETECTBOX tlwh = t.to_tlwh();
+                int x = ClampInt(static_cast<int>(tlwh(0)), 0, frame_w - 1);
+                int y = ClampInt(static_cast<int>(tlwh(1)), 0, frame_h - 1);
+                int w = std::max(1, std::min(static_cast<int>(tlwh(2)), frame_w - x));
+                int h = std::max(1, std::min(static_cast<int>(tlwh(3)), frame_h - y));
+
+                if (encoder_frame->format() == axvsdk::common::PixelFormat::kNv12) {
+                    x &= ~1;
+                    y &= ~1;
+                    w &= ~1;
+                    h &= ~1;
+                    if (x + w > frame_w) w = (frame_w - x) & ~1;
+                    if (y + h > frame_h) h = (frame_h - y) & ~1;
+                }
+
+                const int w_max = frame_w - x - 1;
+                const int h_max = frame_h - y - 1;
+                if (w_max <= 0 || h_max <= 0) continue;
+                w = std::min(w, w_max);
+                h = std::min(h, h_max);
+                if (encoder_frame->format() == axvsdk::common::PixelFormat::kNv12) {
+                    w = std::min(w & ~1, w_max & ~1);
+                    h = std::min(h & ~1, h_max & ~1);
+                }
+                if (w < 2 || h < 2) continue;
+
+                draw.rects.push_back(axvsdk::common::DrawRect{
+                    x,
+                    y,
+                    static_cast<std::uint32_t>(w),
+                    static_cast<std::uint32_t>(h),
+                    2,
+                    255,
+                    ColorForIdRgb(t.track_id),
+                    false,
+                    false,
+                    0,
+                    0,
+                });
+            }
+            (void)drawer->Draw(draw, *encoder_frame);
+
+            if (encoder->SubmitFrame(std::move(encoder_frame))) {
+                submitted_frames.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                dropped_frames.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            const auto processed = processed_frames.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (max_frames > 0 && processed >= static_cast<std::uint64_t>(max_frames)) {
+                stop_requested.store(true, std::memory_order_relaxed);
+            }
+        },
+        axvsdk::codec::FrameCallbackMode::kQueue);
+
+    if (!encoder->Start()) {
+        std::cerr << "[demo_axvsdk_deepsort] encoder Start failed\n";
+        muxer->Close();
+        encoder->Close();
+        decoder->Close();
+        demuxer->Close();
+        return 6;
+    }
+    if (!decoder->Start()) {
+        std::cerr << "[demo_axvsdk_deepsort] decoder Start failed\n";
+        encoder->Stop();
+        muxer->Close();
+        encoder->Close();
+        decoder->Close();
+        demuxer->Close();
+        return 6;
+    }
+
+    std::atomic<bool> stop_feed{false};
+    std::thread feed_thread([&] {
+        while (!stop_feed.load(std::memory_order_relaxed)) {
+            axvsdk::codec::EncodedPacket packet;
+            if (!demuxer->ReadPacket(&packet)) {
+                break;
+            }
+            if (!decoder->SubmitPacket(std::move(packet))) {
+                break;
+            }
+        }
+        if (!stop_feed.load(std::memory_order_relaxed)) {
+            feed_reached_eos.store(true, std::memory_order_relaxed);
+            (void)decoder->SubmitEndOfStream();
+        }
+    });
+
+    const auto start = std::chrono::steady_clock::now();
+    auto last_print = start;
+    std::uint64_t last_processed = 0;
+    std::uint64_t last_encoded = 0;
+    auto last_progress = start;
+
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto processed = processed_frames.load(std::memory_order_relaxed);
+        const auto encoded = encoded_packets.load(std::memory_order_relaxed);
+        if (processed != last_processed || encoded != last_encoded) {
+            last_processed = processed;
+            last_encoded = encoded;
+            last_progress = now;
         }
 
-        // 4) DeepSORT update.
-        trk.predict();
-        trk.update(detections);
-
-        // 5) Draw OSD (same ID keeps same color).
-        axvsdk::common::DrawFrame osd{};
-        osd.hold_frames = 3;
-        for (Track& t : trk.tracks) {
-            if (!t.is_confirmed() || t.time_since_update > 1) continue;
-            const DETECTBOX tlwh = t.to_tlwh();
-            int x = ClampInt(static_cast<int>(tlwh(0)), 0, static_cast<int>(frame->width()) - 1);
-            int y = ClampInt(static_cast<int>(tlwh(1)), 0, static_cast<int>(frame->height()) - 1);
-            int w = std::max(1, std::min(static_cast<int>(tlwh(2)), static_cast<int>(frame->width()) - x));
-            int h = std::max(1, std::min(static_cast<int>(tlwh(3)), static_cast<int>(frame->height()) - y));
-
-            // AXCL IVPS OSD on NV12 is safest with even-aligned geometry.
-            const int frame_w = static_cast<int>(frame->width());
-            const int frame_h = static_cast<int>(frame->height());
-            if (frame->format() == axvsdk::common::PixelFormat::kNv12) {
-                x &= ~1;
-                y &= ~1;
-                w &= ~1;
-                h &= ~1;
-                if (x + w > frame_w) {
-                    w = (frame_w - x) & ~1;
-                }
-                if (y + h > frame_h) {
-                    h = (frame_h - y) & ~1;
-                }
-            }
-
-            // AXCL_IVPS_DrawRect seems to reject rectangles that touch the bottom/right edge.
-            // Keep a 1px margin to be safe.
-            const int w_max = frame_w - x - 1;
-            const int h_max = frame_h - y - 1;
-            if (w_max <= 0 || h_max <= 0) continue;
-            w = std::min(w, w_max);
-            h = std::min(h, h_max);
-            if (frame->format() == axvsdk::common::PixelFormat::kNv12) {
-                w = std::min(w & ~1, w_max & ~1);
-                h = std::min(h & ~1, h_max & ~1);
-            }
-            if (w < 2 || h < 2) continue;
-            std::uint16_t thickness = 2;
-            osd.rects.push_back(axvsdk::common::DrawRect{
-                x,
-                y,
-                static_cast<std::uint32_t>(w),
-                static_cast<std::uint32_t>(h),
-                thickness,
-                255,
-                ColorForIdRgb(t.track_id),
-                false,
-                false,
-                0,
-                0,
-            });
+        if (max_frames > 0 && processed >= static_cast<std::uint64_t>(max_frames)) {
+            break;
         }
-        (void)pipeline->SetOsd(osd);
-
-        ++processed_frames;
-        if (max_frames > 0 && static_cast<int>(processed_frames) >= max_frames) {
+        if (feed_reached_eos.load(std::memory_order_relaxed) &&
+            (now - last_progress) > std::chrono::seconds(2) &&
+            encoded > 0) {
             break;
         }
 
-        if ((processed_frames % 50) == 0) {
-            std::cerr << "[demo_axvsdk_deepsort] processed=" << processed_frames
-                      << " decoded=" << stats.decoded_frames
-                      << " encoded=" << encoded_packets << "\n";
+        if ((now - last_print) > std::chrono::seconds(1)) {
+            last_print = now;
+            const double elapsed_s =
+                std::chrono::duration_cast<std::chrono::duration<double>>(now - start).count();
+            const double fps = elapsed_s > 0.0 ? static_cast<double>(processed) / elapsed_s : 0.0;
+            std::cerr << "[demo_axvsdk_deepsort] processed=" << processed
+                      << " decoded=" << decoded_frames.load(std::memory_order_relaxed)
+                      << " submitted=" << submitted_frames.load(std::memory_order_relaxed)
+                      << " dropped=" << dropped_frames.load(std::memory_order_relaxed)
+                      << " encoded=" << encoded
+                      << " fps=" << fps << "\n";
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    std::cerr << "[demo_axvsdk_deepsort] stopping pipeline...\n";
-    pipeline->Stop();
-    pipeline->Close();
+    stop_feed.store(true, std::memory_order_relaxed);
+    demuxer->Interrupt();
+    std::cerr << "[demo_axvsdk_deepsort] stopping decoder...\n";
+    decoder->Stop();
+    if (feed_thread.joinable()) {
+        feed_thread.join();
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    std::cerr << "[demo_axvsdk_deepsort] stopping encoder...\n";
+    encoder->Stop();
+    encoder->Close();
+    decoder->Close();
+    muxer->Close();
+    demuxer->Close();
+
     std::cerr << "[demo_axvsdk_deepsort] done output=" << output_path << "\n";
     return 0;
 }
